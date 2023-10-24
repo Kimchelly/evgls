@@ -21,7 +21,10 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 )
 
+// kim: TODO: get aliases/anchors working with go to definition
+
 /*
+textDocument/completion
 textDocument/definition
 textDocument/references
 
@@ -409,7 +412,12 @@ func (nv *nodeRefVisitor) Visit(curr ast.Node) ast.Visitor {
 		log.Printf("cannot convert ref kind '%s' to path regexp\n", nv.refKindToFind)
 		return nil
 	}
-	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.String() {
+	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.String() &&
+		// Function names are the black sheep of the YAML and use map keys
+		// instead of sequences with name values. Specifically if it's a
+		// function, the map key (and therefore the end of the node path) must
+		// be the ref ID.
+		(nv.refKindToFind != referenceKindFunction || strings.HasSuffix(path, nv.refIDToFind)) {
 		log.Println("found matching ref:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
 		nv.finder.found = curr
 		return nil
@@ -424,7 +432,7 @@ func (nv *nodeRefVisitor) Visit(curr ast.Node) ast.Visitor {
 
 var (
 	refKindBVMatch       = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.name$`)
-	refKindFunctionMatch = regexp.MustCompile(`^\$\.functions\[\d+\]\.name$`)
+	refKindFunctionMatch = regexp.MustCompile(`^\$\.functions\.([[:alnum:]]+)$`)
 	refKindTaskMatch     = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name$`)
 	refKindTaskOrTGMatch = regexp.MustCompile(`^\$\.((tasks\[\d+\]\.name)|(task_groups\[\d+\]\.name))$`)
 )
