@@ -22,7 +22,7 @@ import (
 )
 
 // kim: TODO: start working on find references
-// kim: TODO: get aliases/anchors working with go to definition (low priority)
+// kim: TODO: get aliases/anchors/merge keys working with go to definition (low priority)
 
 /*
 textDocument/completion
@@ -282,7 +282,7 @@ var (
 	// Task name
 	taskPath = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name$`)
 	// Task selector (i.e. task, task group, or tag) under BV def
-	bvTaskPath = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.tasks\[\d+\](\.name)?`)
+	bvTaskSelectorPath = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.tasks\[\d+\](\.name)?`)
 	// Task under task group def
 	tgTaskPath = regexp.MustCompile(`^\$\.task_groups\[\d+\]\.tasks\[\d+\]$`)
 
@@ -296,10 +296,15 @@ var (
 	dependsOnBVPath = regexp.MustCompile(`^\$\.((tasks\[\d+\])|(buildvariants\[\d+\])|(buildvariants\[\d+\]\.tasks\[\d+\]))\.depends_on\[\d+\]\.variant$`)
 
 	// Task group def
-	tgPath = regexp.MustCompile(`^$\$\.(task_groups\[\d+\])\.name`)
+	tgPath = regexp.MustCompile(`^\$\.(task_groups\[\d+\])\.name`)
+
+	// BV def
+	bvPath = regexp.MustCompile(`^\$\.(buildvariants\[\d+\])\.name`)
 
 	// Func name under pre, post, timeout, task, or task group
 	funcPath = regexp.MustCompile(`^\$\.((pre\[\d+\])|(post\[\d+\])|(timeout\[\d+\])|(tasks\[\d+\]\.commands\[\d+\])|(task_groups\[\d+\]\.((setup_group\[\d+\])|(setup_task\[\d+\])|(teardown_task\[\d+\])|(teardown_group\[\d+\])|(timeout\[\d+\]))))\.func$`)
+	// Func def
+	funcDefPath = regexp.MustCompile(`^\$\.functions\.[^.]+$`)
 
 	// Distro name under task def, BV def, or BVTU def (note: BVTU distros is
 	// deprecated, so don't support it)
@@ -366,9 +371,18 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 
 		path := curr.GetPath()
 
-		if bvTaskPath.MatchString(path) {
-			// TODO: have to handle tag selector syntax (e.g. ".tag" "!.negated-tag") specially
-			nv.finder.foundRefKind = referenceKindTaskOrTaskGroup
+		if bvTaskSelectorPath.MatchString(path) {
+			if !strings.Contains(curr.String(), ".") {
+				// If it doesn't have a dot, it must be referencing a task or
+				// task group.
+				nv.finder.foundRefKind = referenceKindTaskOrTaskGroup
+			}
+
+			// If using tag selector syntax, determine which particular tag
+			// it is within the string.
+			strings.Index(curr.String(), " ")
+			// kim: TODO: handle tags
+
 		} else if taskPath.MatchString(path) || tgTaskPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindTask
 		} else if execTaskPath.MatchString(path) {
@@ -378,6 +392,8 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 			nv.finder.foundRefKind = referenceKindTask
 		} else if tgPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindTaskGroup
+		} else if bvPath.MatchString(path) {
+			nv.finder.foundRefKind = referenceKindBuildVariant
 		} else if dependsOnBVPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindBuildVariant
 		} else if dependsOnTaskPath.MatchString(path) {
@@ -385,7 +401,7 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 			// deps can be specified as either just task name or by explicit
 			// task name + BV.
 			nv.finder.foundRefKind = referenceKindTask
-		} else if funcPath.MatchString(path) {
+		} else if funcPath.MatchString(path) || (funcDefPath.MatchString(path)) {
 			nv.finder.foundRefKind = referenceKindFunction
 		} else if distroPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindDistro
@@ -442,9 +458,54 @@ func (nv *nodeDefVisitor) Visit(curr ast.Node) ast.Visitor {
 
 	path := curr.GetPath()
 	log.Printf("checking node path for matching ref: %s\n", path)
-	pathRegexp := refKindToPath(nv.refKindToFind)
+
+	// See if the path matches the necessary path to the definition. If not,
+	// skip this node tree entirely.
+	pathPrefixOptimization := refKindToDefPrefixOptimization(nv.refKindToFind)
+	var hasPathPrefix bool
+	splitPath := strings.Split(path, ".")
+	if len(pathPrefixOptimization) == 0 {
+		// Since this is just an optimization, skip optimizing if we have no
+		// prefix to optimize with.
+		hasPathPrefix = true
+	}
+
+findPrefixPath:
+	for _, pathPrefix := range pathPrefixOptimization {
+		splitPathPrefix := strings.Split(pathPrefix, ".")
+
+		// Node path is longer than path prefix, so it can't be a match.
+		if len(splitPath) > len(splitPathPrefix) {
+			continue
+		}
+
+		for i := range splitPathPrefix {
+			if i > len(splitPath)-1 {
+				// Node path is shorter, but it's a prefix.
+				hasPathPrefix = true
+				break findPrefixPath
+			}
+			// TODO: This would be smarter if it was a regexp to handle weird
+			// cases like a map key called task_groups_abc instead of
+			// task_groups, but I don't care enough to handle that.
+			if !strings.HasPrefix(splitPath[i], splitPathPrefix[i]) {
+				continue findPrefixPath
+			}
+		}
+
+		// Didn't find any discontinuities, so it's either a prefix path or the
+		// path itself.
+		hasPathPrefix = true
+		break
+	}
+	if !hasPathPrefix {
+		log.Printf("path '%s' is not a path prefix\n", path)
+		return nil
+	}
+
+	pathRegexp := refKindToDefPath(nv.refKindToFind)
 	if pathRegexp == nil {
-		log.Printf("cannot convert ref kind '%s' to path regexp\n", nv.refKindToFind)
+		log.Printf("cannot convert ref type '%s' to path regexp\n", nv.refKindToFind)
 		return nil
 	}
 	// Look for a node that matches the expected YAML path to the definition and
@@ -452,12 +513,24 @@ func (nv *nodeDefVisitor) Visit(curr ast.Node) ast.Visitor {
 	// Function names are the black sheep of the YAML and use map keys instead
 	// of sequences with name values. Specifically if it's a function, the map
 	// key (and therefore the end of the node path) must be the ref ID.
-	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.String() &&
+	// Need to use the value instead of the string form to remove quotation
+	// marks.
+	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.GetToken().Value &&
 		(nv.refKindToFind != referenceKindFunction || strings.HasSuffix(path, nv.refIDToFind)) {
 		log.Println("found matching ref:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
 		nv.finder.found = curr
 		return nil
 	}
+
+	// If we've gone any further into the node tree, there's no match and we've
+	// gone too far, so give up on this tree entirely.
+	deeperPathRegexp := regexp.MustCompile(pathRegexp.String() + `\.`)
+	if deeperPathRegexp.MatchString(path) {
+		return nil
+	}
+
+	// Specifically for functions, if we've gotten to the functions level and
+	// the last element is not the function name, give up.
 
 	return &nodeDefVisitor{
 		finder:        nv.finder,
@@ -467,29 +540,58 @@ func (nv *nodeDefVisitor) Visit(curr ast.Node) ast.Visitor {
 }
 
 var (
-	refKindBVMatch       = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.name$`)
-	refKindFunctionMatch = regexp.MustCompile(`^\$\.functions\.([[:alnum:]]+)$`)
-	refKindTaskMatch     = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name$`)
-	refKindTaskOrTGMatch = regexp.MustCompile(`^\$\.((tasks\[\d+\]\.name)|(task_groups\[\d+\]\.name))$`)
+	refKindBVMatch        = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.name`)
+	refKindFunctionMatch  = regexp.MustCompile(`^\$\.functions\.[^.]+`)
+	refKindTaskMatch      = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name`)
+	refKindTaskGroupMatch = regexp.MustCompile(`^\$\.task_groups\[\d+\]\.name`)
+	refKindTaskOrTGMatch  = regexp.MustCompile(`^\$\.((tasks\[\d+\]\.name)|(task_groups\[\d+\]\.name))`)
 )
 
-// refKindToPrefixPath returns the YAML path prefix for a particular reference
-// kind.
+// refKindToDefPath returns the YAML definition path pattern for a particular
+// reference kind.
 // TODO: This doesn't work if there are aliases/anchors, but whatever, this is
 // bad code anyways. One potential implementation of go to definition could be
 // to jump to the line where the definition dereferences the alias. Then would
 // need special separate handling for jumping to an alias/anchor definition if
 // the user needs to see the anchor.
-func refKindToPath(kind evgReferenceKind) *regexp.Regexp {
+func refKindToDefPath(kind evgReferenceKind) *regexp.Regexp {
 	switch kind {
 	case referenceKindBuildVariant:
 		return refKindBVMatch
 	case referenceKindFunction:
+		// This intentionally doesn't include the function name because the
+		// function name could include special characters that mess up the
+		// regexp... Sigh, functions...
 		return refKindFunctionMatch
 	case referenceKindTask:
 		return refKindTaskMatch
 	case referenceKindTaskOrTaskGroup:
 		return refKindTaskOrTGMatch
+	case referenceKindTaskGroup:
+		return refKindTaskGroupMatch
+	default:
+		return nil
+	}
+}
+
+// refKindToPrefixOptimization reduces the amount of searching necessary to find
+// a matching YAML definition prefix path pattern.
+func refKindToDefPrefixOptimization(kind evgReferenceKind) []string {
+	switch kind {
+	case referenceKindBuildVariant:
+		return []string{"$.buildvariants.name"}
+	case referenceKindFunction:
+		// Functions are actually the worst, so we have to allow matching any
+		// arbitrary function name. Because Walk iterates through sibling nodes
+		// in order, we'll only know if we can stop traversing the node tree if
+		// we've checked all the function names.
+		return []string{fmt.Sprintf("$.functions.")}
+	case referenceKindTask:
+		return []string{"$.tasks.name"}
+	case referenceKindTaskGroup:
+		return []string{"$.task_groups.name"}
+	case referenceKindTaskOrTaskGroup:
+		return []string{"$.tasks.name", "$.task_groups.name"}
 	default:
 		return nil
 	}
@@ -541,7 +643,10 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 		return nil, errors.Errorf("element at position '%s' is not a valid reference", yamlPosToString(yamlPos))
 	}
 	log.Printf("found matching positional node: %s at position '%s' of type %s\n", nf.found.String(), yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind)
-	refID := nf.found.String()
+	// Use the string value instead of the literal string to avoid quotation
+	// marks in refs (e.g. the YAML string "foo" should extract the string value
+	// foo without quotation marks).
+	refID := nf.found.GetToken().Value
 	refKind := nf.foundRefKind
 
 	if refKind == referenceKindCommand || refKind == referenceKindDistro || refKind == referenceKindTag {
