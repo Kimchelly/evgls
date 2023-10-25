@@ -259,6 +259,7 @@ type nodePositionFinder struct {
 	posToFind    token.Position
 	rootVisitor  *nodePositionVisitor
 	found        ast.Node
+	foundRefID   string
 	foundRefKind evgReferenceKind
 }
 
@@ -296,10 +297,10 @@ var (
 	dependsOnBVPath = regexp.MustCompile(`^\$\.((tasks\[\d+\])|(buildvariants\[\d+\])|(buildvariants\[\d+\]\.tasks\[\d+\]))\.depends_on\[\d+\]\.variant$`)
 
 	// Task group def
-	tgPath = regexp.MustCompile(`^\$\.(task_groups\[\d+\])\.name`)
+	tgPath = regexp.MustCompile(`^\$\.(task_groups\[\d+\])\.name$`)
 
 	// BV def
-	bvPath = regexp.MustCompile(`^\$\.(buildvariants\[\d+\])\.name`)
+	bvPath = regexp.MustCompile(`^\$\.(buildvariants\[\d+\])\.name$`)
 
 	// Func name under pre, post, timeout, task, or task group
 	funcPath = regexp.MustCompile(`^\$\.((pre\[\d+\])|(post\[\d+\])|(timeout\[\d+\])|(tasks\[\d+\]\.commands\[\d+\])|(task_groups\[\d+\]\.((setup_group\[\d+\])|(setup_task\[\d+\])|(teardown_task\[\d+\])|(teardown_group\[\d+\])|(timeout\[\d+\]))))\.func$`)
@@ -309,6 +310,9 @@ var (
 	// Distro name under task def, BV def, or BVTU def (note: BVTU distros is
 	// deprecated, so don't support it)
 	distroPath = regexp.MustCompile(`^\$\.((tasks\[\d+\])|(buildvariants\[\d+\])|(buildvariants\[\d+\]\.tasks))\.run_on\[\d+\]$`)
+
+	// Tag names under task def or BV def
+	tagPath = regexp.MustCompile(`^\$\.((tasks\[\d+\])|(buildvariants\[\d+\]))\.tags\[\d+\]$`)
 )
 
 func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
@@ -340,32 +344,14 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 		nv.posToFind.Line == currNodePos.Line &&
 		nv.posToFind.Column >= currNodePos.Column && nv.posToFind.Column <= currNodePos.Column+len(curr.String()) {
 
-		log.Println("found matching positional node:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
 		nv.finder.found = curr
-
-		// For definition lookups, need to look for:
-		// * tasks (under BV and task group)
-		// * depends_on (under BV, task, and BVTU)
-		//     * name (i.e. task)
-		//     * variant
-		// * execution_tasks (under display_tasks)
-		// Any other lookup is invalid.
-
-		/*
-			buildvariants -> one build variant -> tasks -> one task selector
-			task_groups -> one task group -> tasks -> one task selector
-
-			tasks -> one task -> depends_on -> one dependency name
-			buildvariants -> one build variant -> depends_on -> one dependency
-			name
-			buildvariants -> one build variant -> tasks -> one task selector ->
-			depends_on -> one dependency name
-
-			display_tasks -> execution_tasks -> one execution task
-		*/
+		// Use the string value instead of the literal string to avoid quotation
+		// marks in refs (e.g. the YAML string "foo" should extract the string
+		// value foo without quotation marks).
+		nv.finder.foundRefID = curr.GetToken().Value
 
 		// Use the YAML path (which is a string representing the path of nodes
-		// down to this one) to determine the context of the current thing being
+		// down to this one) to determine the context of the current node being
 		// referenced.
 		// Reference: https://github.com/vmware-labs/yaml-jsonpath#syntax
 
@@ -378,11 +364,27 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 				nv.finder.foundRefKind = referenceKindTaskOrTaskGroup
 			}
 
+			nv.finder.foundRefKind = referenceKindTag
+
 			// If using tag selector syntax, determine which particular tag
 			// it is within the string.
-			strings.Index(curr.String(), " ")
-			// kim: TODO: handle tags
-
+			colWithinSelector := currNodePos.Column
+			if curr.GetToken().Indicator == token.QuotedScalarIndicator {
+				// Since we're parsing the string literal, skip the leading
+				// quotation mark, if any.
+				colWithinSelector++
+			}
+			for _, criterion := range strings.Split(curr.GetToken().Value, " ") {
+				// Figure out from the position to find which tag is being
+				// specifically requested.
+				if nv.posToFind.Column >= colWithinSelector && nv.posToFind.Column < colWithinSelector+len(criterion) {
+					tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
+					nv.finder.foundRefID = tag
+					break
+				}
+				// Skip past criterion and whitespace.
+				colWithinSelector = colWithinSelector + len(criterion) + 1
+			}
 		} else if taskPath.MatchString(path) || tgTaskPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindTask
 		} else if execTaskPath.MatchString(path) {
@@ -390,21 +392,21 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 			// definitions can refer to task groups, but I'm gonna pretend it
 			// doesn't for my own sanity.
 			nv.finder.foundRefKind = referenceKindTask
-		} else if tgPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindTaskGroup
-		} else if bvPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindBuildVariant
-		} else if dependsOnBVPath.MatchString(path) {
+		} else if bvPath.MatchString(path) || dependsOnBVPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindBuildVariant
 		} else if dependsOnTaskPath.MatchString(path) {
 			// The order of checks for variant/task deps is important because
 			// deps can be specified as either just task name or by explicit
 			// task name + BV.
 			nv.finder.foundRefKind = referenceKindTask
-		} else if funcPath.MatchString(path) || (funcDefPath.MatchString(path)) {
+		} else if tgPath.MatchString(path) {
+			nv.finder.foundRefKind = referenceKindTaskGroup
+		} else if funcPath.MatchString(path) || funcDefPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindFunction
 		} else if distroPath.MatchString(path) {
 			nv.finder.foundRefKind = referenceKindDistro
+		} else if tagPath.MatchString(path) {
+			nv.finder.foundRefKind = referenceKindTag
 		} else {
 			// Not a recognized reference.
 		}
@@ -513,8 +515,9 @@ findPrefixPath:
 	// Function names are the black sheep of the YAML and use map keys instead
 	// of sequences with name values. Specifically if it's a function, the map
 	// key (and therefore the end of the node path) must be the ref ID.
-	// Need to use the value instead of the string form to remove quotation
-	// marks.
+	// Use the string value instead of the literal string to avoid quotation
+	// marks (e.g. the YAML string "foo" should match the string value foo
+	// without quotation marks).
 	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.GetToken().Value &&
 		(nv.refKindToFind != referenceKindFunction || strings.HasSuffix(path, nv.refIDToFind)) {
 		log.Println("found matching ref:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
@@ -639,14 +642,14 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 	if nf.found == nil {
 		return nil, errors.Errorf("no matching node found at position '%s'", yamlPosToString(yamlPos))
 	}
-	if nf.foundRefKind == "" {
-		return nil, errors.Errorf("element at position '%s' is not a valid reference", yamlPosToString(yamlPos))
+	if nf.foundRefID == "" {
+		return nil, errors.Errorf("no ref ID could be extracted from node at position '%s'", yamlPosToString(yamlPos))
 	}
-	log.Printf("found matching positional node: %s at position '%s' of type %s\n", nf.found.String(), yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind)
-	// Use the string value instead of the literal string to avoid quotation
-	// marks in refs (e.g. the YAML string "foo" should extract the string value
-	// foo without quotation marks).
-	refID := nf.found.GetToken().Value
+	if nf.foundRefKind == "" {
+		return nil, errors.Errorf("no matching reference kind found for node at position '%s'", yamlPosToString(yamlPos))
+	}
+	log.Printf("found matching positional node: '%s' with ID '%s' at position '%s' of type %s\n", nf.found.String(), nf.foundRefID, yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind)
+	refID := nf.foundRefID
 	refKind := nf.foundRefKind
 
 	if refKind == referenceKindCommand || refKind == referenceKindDistro || refKind == referenceKindTag {
