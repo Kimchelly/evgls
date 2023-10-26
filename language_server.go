@@ -470,7 +470,6 @@ findPrefixPath:
 	// without quotation marks).
 	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.GetToken().Value &&
 		(nv.refKindToFind != referenceKindFunction || strings.HasSuffix(path, nv.refIDToFind)) {
-		log.Println("found matching ref:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
 		nv.finder.found = &nodeRef{
 			refID:   nv.refIDToFind,
 			refKind: nv.refKindToFind,
@@ -805,7 +804,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if bvTaskSelectorPath.MatchString(path) && !strings.Contains(node.String(), ".") {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -814,7 +813,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			tkn := node.GetToken()
 
 			if tagPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 
 			if !bvTaskSelectorPath.MatchString(path) {
@@ -827,12 +826,8 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 
 			// If using tag selector syntax, determine which particular tag
 			// it is within the string.
-			colWithinSelector := tkn.Position.Column
-			if tkn.Indicator == token.QuotedScalarIndicator {
-				// Since we're parsing the string literal, skip the leading
-				// quotation mark, if any.
-				colWithinSelector++
-			}
+			pos := nodePosForRef(node)
+			colWithinSelector := pos.Column
 			for _, criterion := range strings.Split(tkn.Value, " ") {
 				// Figure out from the position to find which tag is being
 				// specifically requested.
@@ -840,7 +835,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 					// Remove tag notation and any negation.
 					tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
 					return tag, &token.Position{
-						Line:   tkn.Position.Line,
+						Line:   pos.Line,
 						Column: colWithinSelector + len(criterion) - len(tag),
 					}, true
 				}
@@ -853,12 +848,12 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if taskPath.MatchString(path) || tgTaskPath.MatchString(path) || execTaskPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			// Since the depends on task path can omit the name, it's ambiguous
 			// unless you check that it's not a BV.
 			if dependsOnTaskPath.MatchString(path) && !dependsOnBVPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -866,7 +861,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if tgPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -874,7 +869,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if bvPath.MatchString(path) || dependsOnBVPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -882,7 +877,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if distroPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -890,7 +885,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if funcPath.MatchString(path) || funcDefPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -898,7 +893,7 @@ func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int
 			path := node.GetPath()
 			tkn := node.GetToken()
 			if cmdPath.MatchString(path) {
-				return tkn.Value, tkn.Position, true
+				return tkn.Value, nodePosForRef(node), true
 			}
 			return "", nil, false
 		},
@@ -940,29 +935,20 @@ func uriToFilepath(uri lsp.DocumentURI) (string, error) {
 	return path, nil
 }
 
+// nodePosForRef returns the position of the node's ref, adjusted for literal
+// string marks (e.g. the YAML string "foo" should identify the starting
+// position as f instead of the quotation mark).
+func nodePosForRef(node ast.Node) *token.Position {
+	pos := *node.GetToken().Position
+	if node.GetToken().Indicator == token.QuotedScalarIndicator {
+		// Since we're parsing the string literal, skip the leading quotation
+		// mark, if any.
+		pos.Column++
+	}
+	return &pos
+}
+
 func (lsh *LanguageServerHandler) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params lsp.CompletionParams) (*lsp.CompletionList, error) {
-	// filepath, err := uriToFilepath(params.TextDocument.URI)
-	// if err != nil {
-	//     return nil, errors.Wrapf(err, "getting filepath from URI '%s'", params.TextDocument.URI)
-	// }
-	//
-	// parsed, err := parser.ParseFile(filepath, 0)
-	// if err != nil {
-	//     return nil, errors.Wrapf(err, "parsing YAML file '%s'", filepath)
-	// }
-
-	// Based on the position in the text document, ascertain what set of names
-	// could be filled in (e.g. statically-known key names, valid values
-	// including references).
-
-	// for _, doc := range parsed.Docs {
-	//     nf := nodeFinder{pos: params.Position}
-	//     ast.Walk(nf, doc.Body)
-	//     if nf.found == nil {
-	//         return nil, errors.Errorf("no matching node found at position '%s'", params.Position.String())
-	//     }
-	// }
-
 	return nil, errors.New("TODO: implement")
 }
 
