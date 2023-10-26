@@ -21,7 +21,6 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 )
 
-// kim: TODO: start working on find references
 // kim: TODO: start working on documentation (static)
 //  TODO: get aliases/anchors/merge keys working with go to definition (low priority)
 
@@ -252,11 +251,9 @@ const (
 )
 
 type nodePositionFinder struct {
-	posToFind    token.Position
-	rootVisitor  *nodePositionVisitor
-	found        ast.Node
-	foundRefID   string
-	foundRefKind evgReferenceKind
+	posToFind   token.Position
+	rootVisitor *nodePositionVisitor
+	found       *nodeRef
 }
 
 func (nf *nodePositionFinder) Visit(curr ast.Node) ast.Visitor {
@@ -274,7 +271,7 @@ type nodePositionVisitor struct {
 }
 
 var (
-	// Heh, regexp pain
+	// Heh, regexp pain 🙈
 
 	// Task name
 	taskPath = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name$`)
@@ -343,23 +340,22 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 		nv.posToFind.Line == currNodePos.Line &&
 		nv.posToFind.Column >= currNodePos.Column && nv.posToFind.Column <= currNodePos.Column+len(curr.String()) {
 
-		nv.finder.found = curr
-		// Use the string value instead of the literal string to avoid quotation
-		// marks in refs (e.g. the YAML string "foo" should extract the string
-		// value foo without quotation marks).
-		nv.finder.foundRefID = curr.GetToken().Value
+		nv.finder.found = &nodeRef{node: curr}
 
 		// Use the YAML path (which is a string representing the path of nodes
 		// down to this one) to determine the context of the current node being
 		// referenced.
 		// Reference: https://github.com/vmware-labs/yaml-jsonpath#syntax
 
-		refMatches := refKindToMatchingNode(nv.posToFind)
+		refMatches := refKindToMatchingNode(func(criterion string, col int) bool {
+			return nv.posToFind.Column >= col && nv.posToFind.Column < col+len(criterion)
+		})
 		for refKind, getMatch := range refMatches {
-			refID, _, match := getMatch(curr)
-			if match {
-				nv.finder.foundRefKind = refKind
-				nv.finder.foundRefID = refID
+			refID, pos, isMatch := getMatch(curr)
+			if isMatch {
+				nv.finder.found.refID = refID
+				nv.finder.found.refKind = refKind
+				nv.finder.found.pos = *pos
 				break
 			}
 		}
@@ -382,7 +378,7 @@ type nodeDefFinder struct {
 	refIDToFind   string
 	refKindToFind evgReferenceKind
 	rootVisitor   *nodeDefVisitor
-	found         ast.Node
+	found         *nodeRef
 }
 
 func (nf *nodeDefFinder) Visit(curr ast.Node) ast.Visitor {
@@ -436,7 +432,8 @@ findPrefixPath:
 
 		for i := range splitPathPrefix {
 			if i > len(splitPath)-1 {
-				// Node path is shorter, but it's a prefix.
+				// Node path is shorter than full pattern, but it still matches
+				// the prefix pattern.
 				hasPathPrefix = true
 				break findPrefixPath
 			}
@@ -474,7 +471,12 @@ findPrefixPath:
 	if pathRegexp.MatchString(path) && nv.refIDToFind == curr.GetToken().Value &&
 		(nv.refKindToFind != referenceKindFunction || strings.HasSuffix(path, nv.refIDToFind)) {
 		log.Println("found matching ref:", curr.Type(), curr.String(), curr.GetPath(), curr.GetToken().Position.Line, curr.GetToken().Position.Column)
-		nv.finder.found = curr
+		nv.finder.found = &nodeRef{
+			refID:   nv.refIDToFind,
+			refKind: nv.refKindToFind,
+			node:    curr,
+			pos:     *curr.GetToken().Position,
+		}
 		return nil
 	}
 
@@ -496,11 +498,11 @@ findPrefixPath:
 }
 
 var (
-	refKindBVMatch        = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.name`)
-	refKindFunctionMatch  = regexp.MustCompile(`^\$\.functions\.[^.]+`)
-	refKindTaskMatch      = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name`)
-	refKindTaskGroupMatch = regexp.MustCompile(`^\$\.task_groups\[\d+\]\.name`)
-	refKindTaskOrTGMatch  = regexp.MustCompile(`^\$\.((tasks\[\d+\]\.name)|(task_groups\[\d+\]\.name))`)
+	defKindBVMatch       = regexp.MustCompile(`^\$\.buildvariants\[\d+\]\.name`)
+	defKindFuncMatch     = regexp.MustCompile(`^\$\.functions\.[^.]+`)
+	defKindTaskMatch     = regexp.MustCompile(`^\$\.tasks\[\d+\]\.name`)
+	defKindTGMatch       = regexp.MustCompile(`^\$\.task_groups\[\d+\]\.name`)
+	defKindTaskOrTGMatch = regexp.MustCompile(`^\$\.((tasks\[\d+\]\.name)|(task_groups\[\d+\]\.name))`)
 )
 
 // refKindToDefPath returns the YAML definition path pattern for a particular
@@ -513,18 +515,18 @@ var (
 func refKindToDefPath(kind evgReferenceKind) *regexp.Regexp {
 	switch kind {
 	case referenceKindBuildVariant:
-		return refKindBVMatch
+		return defKindBVMatch
 	case referenceKindFunction:
 		// This intentionally doesn't include the function name because the
 		// function name could include special characters that mess up the
-		// regexp... Sigh, functions...
-		return refKindFunctionMatch
+		// path regexp... Sigh, functions... 😒
+		return defKindFuncMatch
 	case referenceKindTask:
-		return refKindTaskMatch
+		return defKindTaskMatch
 	case referenceKindTaskOrTaskGroup:
-		return refKindTaskOrTGMatch
+		return defKindTaskOrTGMatch
 	case referenceKindTaskGroup:
-		return refKindTaskGroupMatch
+		return defKindTGMatch
 	default:
 		return nil
 	}
@@ -579,56 +581,40 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 	if err != nil {
 		return nil, errors.Wrapf(err, "parsing YAML file '%s'", filepath)
 	}
-	if len(parsed.Docs) == 0 {
-		return nil, errors.Errorf("file had no YAML documents", filepath)
-	}
-	doc := parsed.Docs[0]
 
 	// Based on the position in the text document, ascertain what the identifier
 	// and kind of reference that's being looked up (e.g. task, function, etc).
 
-	yamlPos := convertLSPPositionToYAMLPosition(params.Position)
-	nf := &nodePositionFinder{
-		posToFind: yamlPos,
+	refToFind, err := findRefFromPos(*parsed, params.Position)
+	if err != nil {
+		return nil, errors.Wrap(err, "finding reference from position")
 	}
-	ast.Walk(nf, doc.Body)
-	if nf.found == nil {
-		return nil, errors.Errorf("no matching node found at position '%s'", yamlPosToString(yamlPos))
-	}
-	if nf.foundRefID == "" {
-		return nil, errors.Errorf("no ref ID could be extracted from node at position '%s'", yamlPosToString(yamlPos))
-	}
-	if nf.foundRefKind == "" {
-		return nil, errors.Errorf("no matching reference kind found for node at position '%s'", yamlPosToString(yamlPos))
-	}
-	log.Printf("found matching positional node: '%s' with ID '%s' at position '%s' of type '%s' with path '%s'\n", nf.found.String(), nf.foundRefID, yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind, nf.found.GetPath())
-	refID := nf.foundRefID
-	refKind := nf.foundRefKind
-
-	if refKind == referenceKindCommand || refKind == referenceKindDistro || refKind == referenceKindTag {
-		return nil, errors.Errorf("cannot get go to definition for type '%s'", refKind)
+	if refToFind.refKind == referenceKindCommand || refToFind.refKind == referenceKindDistro || refToFind.refKind == referenceKindTag {
+		return nil, errors.Errorf("cannot get go to definition for type '%s'", refToFind.refKind)
 	}
 
 	// Look up the definition in the relevant section of the YAML.
 
-	var defLocs []lsp.Location
+	var locs []lsp.Location
 	for _, doc := range parsed.Docs {
 		nf := &nodeDefFinder{
-			refIDToFind:   refID,
-			refKindToFind: refKind,
+			refIDToFind:   refToFind.refID,
+			refKindToFind: refToFind.refKind,
 		}
 		ast.Walk(nf, doc.Body)
 		if nf.found == nil {
-			return nil, errors.Errorf("no matching ref for ID '%s' of type '%s'", refID, refKind)
+			log.Printf("no matching ref for ID '%s' of type '%s'", refToFind.refID, refToFind.refKind)
+			continue
 		}
-		log.Printf("found matching ref node: %s at position '%s'\n", nf.found.String(), yamlPosToString(*nf.found.GetToken().Position))
+
+		log.Printf("found matching ref node: %s at position '%s'\n", nf.found.node.String(), yamlPosToString(*nf.found.node.GetToken().Position))
 
 		// Assuming the reference is on one line.
-		start := *nf.found.GetToken().Position
-		end := *nf.found.GetToken().Position
-		end.Column = end.Column + len(nf.found.String())
+		start := *nf.found.node.GetToken().Position
+		end := *nf.found.node.GetToken().Position
+		end.Column = end.Column + len(nf.found.node.String())
 
-		defLocs = append(defLocs, lsp.Location{
+		locs = append(locs, lsp.Location{
 			// I'm assuming it's in the same file because includes aren't
 			// supported.
 			URI: params.TextDocument.URI,
@@ -639,7 +625,7 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 		})
 	}
 
-	return defLocs, nil
+	return locs, nil
 }
 
 func (lsh *LanguageServerHandler) handleReferences(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params lsp.ReferenceParams) ([]lsp.Location, error) {
@@ -652,42 +638,86 @@ func (lsh *LanguageServerHandler) handleReferences(ctx context.Context, conn *js
 	if err != nil {
 		return nil, errors.Wrapf(err, "parsing YAML file '%s'", filepath)
 	}
-	if len(parsed.Docs) == 0 {
-		return nil, errors.Errorf("file had no YAML documents", filepath)
-	}
-	doc := parsed.Docs[0]
 
 	// Based on the position in the text document, ascertain what the identifier
 	// and kind of reference that's being looked up (e.g. task, function, etc).
 
-	// TODO: does this even need to handle multiple docs within the same file?
-	// You can currently have multiple YAML files using include, but having
-	// multiple docs in the same file doesn't seem useful.
-	nf := &nodePositionFinder{
-		posToFind: convertLSPPositionToYAMLPosition(params.Position),
+	refToFind, err := findRefFromPos(*parsed, params.Position)
+	if err != nil {
+		return nil, errors.Wrap(err, "finding reference from position")
 	}
-	ast.Walk(nf, doc.Body)
-	if nf.found == nil {
-		return nil, errors.Errorf("no matching node found at position '%s'", params.Position.String())
-	}
-	if nf.foundRefKind == "" {
-		return nil, errors.Errorf("element at position '%s' is not a valid reference", params.Position.String())
-	}
-	log.Printf("found matching positional node: %s at position '%s' of type %s\n", nf.found.String(), yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind)
-	refID := nf.found.String()
-	refKind := nf.foundRefKind
 
 	// Find references where that identifier/kind could be used.
-	log.Printf(refID, refKind)
 
-	return []lsp.Location{}, nil
+	var locs []lsp.Location
+	for _, doc := range parsed.Docs {
+		nf := &nodeRefFinder{
+			refIDToFind:   refToFind.refID,
+			refKindToFind: refToFind.refKind,
+		}
+		ast.Walk(nf, doc.Body)
+		if len(nf.found) == 0 {
+			log.Printf("no matching ref for ID '%s' of type '%s'", refToFind.refID, refToFind.refKind)
+			continue
+		}
+		for _, found := range nf.found {
+			log.Printf("found matching ref node: %s at position '%s'\n", found.node.String(), yamlPosToString(found.pos))
+
+			// Assuming the reference is on one line.
+			start := found.pos
+			end := found.pos
+			end.Column = end.Column + len(found.refID)
+
+			locs = append(locs, lsp.Location{
+				// I'm assuming it's in the same file because includes aren't
+				// supported.
+				URI: params.TextDocument.URI,
+				Range: lsp.Range{
+					Start: convertYAMLPositionToLSPPosition(start),
+					End:   convertYAMLPositionToLSPPosition(end),
+				},
+			})
+		}
+	}
+
+	return locs, nil
+}
+
+func findRefFromPos(parsed ast.File, pos lsp.Position) (*nodeRef, error) {
+	yamlPos := convertLSPPositionToYAMLPosition(pos)
+	for _, doc := range parsed.Docs {
+		nf := &nodePositionFinder{
+			posToFind: yamlPos,
+		}
+		ast.Walk(nf, doc.Body)
+		if nf.found == nil {
+			continue
+		}
+		if nf.found.refID == "" {
+			return nil, errors.Errorf("no ref ID could be extracted from node at position '%s'", yamlPosToString(yamlPos))
+		}
+		if nf.found.refKind == "" {
+			return nil, errors.Errorf("no matching reference kind found for node at position '%s'", yamlPosToString(yamlPos))
+		}
+		log.Printf("found matching positional node: %s at position '%s' of type %s\n", nf.found.node.String(), yamlPosToString(*nf.found.node.GetToken().Position), nf.found.refKind)
+
+		return nf.found, nil
+	}
+	return nil, errors.Errorf("no matching node found at position '%s'", yamlPos)
+}
+
+type nodeRef struct {
+	refID   string
+	refKind evgReferenceKind
+	node    ast.Node
+	pos     token.Position
 }
 
 type nodeRefFinder struct {
 	refIDToFind   string
 	refKindToFind evgReferenceKind
 	rootVisitor   *nodeRefVisitor
-	found         []ast.Node
+	found         []nodeRef
 }
 
 func (nf *nodeRefFinder) Visit(curr ast.Node) ast.Visitor {
@@ -715,16 +745,62 @@ func (nv *nodeRefVisitor) Visit(curr ast.Node) ast.Visitor {
 	_, isScalar := curr.(ast.ScalarNode)
 
 	if isScalar {
-		switch nv.refKindToFind {
-
+		pos, isMatch := isMatchingRef(nv.refIDToFind, nv.refKindToFind, curr)
+		if isMatch {
+			nv.finder.found = append(nv.finder.found, nodeRef{
+				refID:   nv.refIDToFind,
+				refKind: nv.refKindToFind,
+				node:    curr,
+				pos:     *pos,
+			})
 		}
 	}
 
 	return nv
 }
 
+// isMatchingRef determines if a node's value matches a ref ID and kind.
+func isMatchingRef(refIDToFind string, refKindToFind evgReferenceKind, node ast.Node) (*token.Position, bool) {
+	// Determine what kind of reference this node is, if any.
+
+	refMatches := refKindToMatchingNode(func(criterion string, col int) bool {
+		return criterion == refIDToFind
+	})
+
+	// kim: TODO: this doesn't detect tag selector references because the node
+	// needs to further split down into multiple tag refs.
+	var nodeRefID string
+	var nodeRefKind evgReferenceKind
+	var nodeRefPos token.Position
+	for refKind, getMatch := range refMatches {
+		refID, pos, isMatch := getMatch(node)
+		if isMatch {
+			nodeRefID = refID
+			nodeRefKind = refKind
+			nodeRefPos = *pos
+			break
+		}
+	}
+	if nodeRefID == "" || nodeRefKind == "" || nodeRefPos.Line == 0 || nodeRefPos.Column == 0 {
+		return nil, false
+	}
+
+	if nodeRefID == refIDToFind && nodeRefKind == refKindToFind {
+		return &nodeRefPos, true
+	}
+
+	isCompatibleRefKind := (refKindToFind == referenceKindTaskOrTaskGroup && (nodeRefKind == referenceKindTask || nodeRefKind == referenceKindTaskGroup)) ||
+		(refKindToFind == referenceKindTaskGroup && nodeRefKind == referenceKindTaskOrTaskGroup) ||
+		(refKindToFind == referenceKindTask && nodeRefKind == referenceKindTaskOrTaskGroup)
+	if nodeRefID == refIDToFind && isCompatibleRefKind {
+		return &nodeRefPos, true
+	}
+
+	return nil, false
+}
+
 // ref kind -> func that returns if node matches or not.
-func refKindToMatchingNode(posToFind token.Position) map[evgReferenceKind]func(node ast.Node) (refID string, pos *token.Position, match bool) {
+func refKindToMatchingNode(isMatchingTagCriterion func(criterion string, col int) bool) map[evgReferenceKind]func(node ast.Node) (refID string, pos *token.Position, match bool) {
 	return map[evgReferenceKind]func(node ast.Node) (refID string, pos *token.Position, match bool){
 		referenceKindTaskOrTaskGroup: func(node ast.Node) (string, *token.Position, bool) {
 			path := node.GetPath()
@@ -746,6 +822,10 @@ func refKindToMatchingNode(posToFind token.Position) map[evgReferenceKind]func(n
 				return "", nil, false
 			}
 
+			if !strings.Contains(node.String(), ".") {
+				return "", nil, false
+			}
+
 			// If using tag selector syntax, determine which particular tag
 			// it is within the string.
 			colWithinSelector := tkn.Position.Column
@@ -757,11 +837,11 @@ func refKindToMatchingNode(posToFind token.Position) map[evgReferenceKind]func(n
 			for _, criterion := range strings.Split(tkn.Value, " ") {
 				// Figure out from the position to find which tag is being
 				// specifically requested.
-				if posToFind.Column >= colWithinSelector && posToFind.Column < colWithinSelector+len(criterion) {
+				if isMatchingTagCriterion(criterion, colWithinSelector) {
 					// Remove tag notation and any negation.
 					tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
 					return tag, &token.Position{
-						Line:   posToFind.Line,
+						Line:   tkn.Position.Line,
 						Column: colWithinSelector + len(criterion) - len(tag),
 					}, true
 				}
