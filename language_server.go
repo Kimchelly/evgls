@@ -764,11 +764,10 @@ func isMatchingRef(refIDToFind string, refKindToFind evgReferenceKind, node ast.
 	// Determine what kind of reference this node is, if any.
 
 	refMatches := refKindToMatchingNode(func(criterion string, col int) bool {
-		return criterion == refIDToFind
+		tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
+		return tag == refIDToFind
 	})
 
-	// kim: TODO: this doesn't detect tag selector references because the node
-	// needs to further split down into multiple tag refs.
 	var nodeRefID string
 	var nodeRefKind evgReferenceKind
 	var nodeRefPos token.Position
