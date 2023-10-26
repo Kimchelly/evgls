@@ -22,7 +22,8 @@ import (
 )
 
 // kim: TODO: start working on find references
-// kim: TODO: get aliases/anchors/merge keys working with go to definition (low priority)
+// kim: TODO: start working on documentation (static)
+//  TODO: get aliases/anchors/merge keys working with go to definition (low priority)
 
 /*
 textDocument/completion
@@ -214,13 +215,13 @@ func (lsh *LanguageServerHandler) Handle(ctx context.Context, conn *jsonrpc2.Con
 	//         }
 	//     }
 	//
-	//     return lsh.handleTextDocumentCompletion(ctx, conn, req, params)
+	//     return lsh.handleCompletion(ctx, conn, req, params)
 	// case "textDocument/didOpen":
-	//     return nil, errors.New("kim: TODO: implement")
+	//     return nil, errors.New("TODO: implement")
 	// case "textDocument/didChange":
-	//     return nil, errors.New("kim: TODO: implement")
+	//     return nil, errors.New("TODO: implement")
 	// case "textDocument/didClose":
-	//     return nil, errors.New("kim: TODO: implement")
+	//     return nil, errors.New(" TODO: implement")
 	default:
 		return nil, &jsonrpc2.Error{
 			Message: fmt.Sprintf("method '%s' not supported", req.Method),
@@ -234,11 +235,6 @@ func (lsh *LanguageServerHandler) Handle(ctx context.Context, conn *jsonrpc2.Con
 type evgReferenceKind string
 
 const (
-	// kim: TODO: for find references, which is a generalization of go to
-	// definition, this has to support more reference kinds (task tags, distro
-	// IDs, command names). Also need to support being at the definition and
-	// looking for references.
-
 	// Ambiguity, yay?
 	referenceKindTaskOrTaskGroup evgReferenceKind = "task_or_task_group"
 
@@ -307,6 +303,9 @@ var (
 	// Func def
 	funcDefPath = regexp.MustCompile(`^\$\.functions\.[^.]+$`)
 
+	// Command name under pre, post, timeout, task, task group, or func
+	cmdPath = regexp.MustCompile(`^\$\.((pre\[\d+\])|(post\[\d+\])|(timeout\[\d+\])|(tasks\[\d+\]\.commands\[\d+\])|(functions\.[^.\[\]]+\[\d+\])|(task_groups\[\d+\]\.((setup_group\[\d+\])|(setup_task\[\d+\])|(teardown_task\[\d+\])|(teardown_group\[\d+\])|(timeout\[\d+\]))))\.command`)
+
 	// Distro name under task def, BV def, or BVTU def (note: BVTU distros is
 	// deprecated, so don't support it)
 	distroPath = regexp.MustCompile(`^\$\.((tasks\[\d+\])|(buildvariants\[\d+\])|(buildvariants\[\d+\]\.tasks))\.run_on\[\d+\]$`)
@@ -328,9 +327,9 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 	// Could optimize by skipping over this node if it doesn't cover the
 	// position to find. Can use position + value to determine its range
 
-	// kim: NOTE: a slightly smarter way to go about this could be to parse the
-	// Evergreen parser project YAML, but with each value would be the starting
-	// line/column.
+	// TODO: a slightly smarter way to go about this could be to parse the
+	// Evergreen parser project YAML, but include each value metadata about the
+	// relevant line/column.
 
 	currNodePos := curr.GetToken().Position
 	// Note: probably should deal with scalars that are map keys instead of
@@ -355,60 +354,14 @@ func (nv *nodePositionVisitor) Visit(curr ast.Node) ast.Visitor {
 		// referenced.
 		// Reference: https://github.com/vmware-labs/yaml-jsonpath#syntax
 
-		path := curr.GetPath()
-
-		if bvTaskSelectorPath.MatchString(path) {
-			if !strings.Contains(curr.String(), ".") {
-				// If it doesn't have a dot, it must be referencing a task or
-				// task group.
-				nv.finder.foundRefKind = referenceKindTaskOrTaskGroup
+		refMatches := refKindToMatchingNode(nv.posToFind)
+		for refKind, getMatch := range refMatches {
+			refID, _, match := getMatch(curr)
+			if match {
+				nv.finder.foundRefKind = refKind
+				nv.finder.foundRefID = refID
+				break
 			}
-
-			nv.finder.foundRefKind = referenceKindTag
-
-			// If using tag selector syntax, determine which particular tag
-			// it is within the string.
-			colWithinSelector := currNodePos.Column
-			if curr.GetToken().Indicator == token.QuotedScalarIndicator {
-				// Since we're parsing the string literal, skip the leading
-				// quotation mark, if any.
-				colWithinSelector++
-			}
-			for _, criterion := range strings.Split(curr.GetToken().Value, " ") {
-				// Figure out from the position to find which tag is being
-				// specifically requested.
-				if nv.posToFind.Column >= colWithinSelector && nv.posToFind.Column < colWithinSelector+len(criterion) {
-					tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
-					nv.finder.foundRefID = tag
-					break
-				}
-				// Skip past criterion and whitespace.
-				colWithinSelector = colWithinSelector + len(criterion) + 1
-			}
-		} else if taskPath.MatchString(path) || tgTaskPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindTask
-		} else if execTaskPath.MatchString(path) {
-			// I'm actually not sure if execution tasks under display task
-			// definitions can refer to task groups, but I'm gonna pretend it
-			// doesn't for my own sanity.
-			nv.finder.foundRefKind = referenceKindTask
-		} else if bvPath.MatchString(path) || dependsOnBVPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindBuildVariant
-		} else if dependsOnTaskPath.MatchString(path) {
-			// The order of checks for variant/task deps is important because
-			// deps can be specified as either just task name or by explicit
-			// task name + BV.
-			nv.finder.foundRefKind = referenceKindTask
-		} else if tgPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindTaskGroup
-		} else if funcPath.MatchString(path) || funcDefPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindFunction
-		} else if distroPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindDistro
-		} else if tagPath.MatchString(path) {
-			nv.finder.foundRefKind = referenceKindTag
-		} else {
-			// Not a recognized reference.
 		}
 
 		return nil
@@ -648,7 +601,7 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 	if nf.foundRefKind == "" {
 		return nil, errors.Errorf("no matching reference kind found for node at position '%s'", yamlPosToString(yamlPos))
 	}
-	log.Printf("found matching positional node: '%s' with ID '%s' at position '%s' of type %s\n", nf.found.String(), nf.foundRefID, yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind)
+	log.Printf("found matching positional node: '%s' with ID '%s' at position '%s' of type '%s' with path '%s'\n", nf.found.String(), nf.foundRefID, yamlPosToString(*nf.found.GetToken().Position), nf.foundRefKind, nf.found.GetPath())
 	refID := nf.foundRefID
 	refKind := nf.foundRefKind
 
@@ -687,10 +640,6 @@ func (lsh *LanguageServerHandler) handleDefinition(ctx context.Context, conn *js
 	}
 
 	return defLocs, nil
-}
-
-func yamlPosToString(pos token.Position) string {
-	return fmt.Sprintf("%d:%d", pos.Line, pos.Column)
 }
 
 func (lsh *LanguageServerHandler) handleReferences(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params lsp.ReferenceParams) ([]lsp.Location, error) {
@@ -734,6 +683,149 @@ func (lsh *LanguageServerHandler) handleReferences(ctx context.Context, conn *js
 	return []lsp.Location{}, nil
 }
 
+type nodeRefFinder struct {
+	refIDToFind   string
+	refKindToFind evgReferenceKind
+	rootVisitor   *nodeRefVisitor
+	found         []ast.Node
+}
+
+func (nf *nodeRefFinder) Visit(curr ast.Node) ast.Visitor {
+	nf.rootVisitor = &nodeRefVisitor{
+		finder:        nf,
+		refIDToFind:   nf.refIDToFind,
+		refKindToFind: nf.refKindToFind,
+	}
+	log.Printf("searching for references to ID '%s' of type '%s'", nf.refIDToFind, nf.refKindToFind)
+	return nf.rootVisitor
+}
+
+type nodeRefVisitor struct {
+	finder        *nodeRefFinder
+	refIDToFind   string
+	refKindToFind evgReferenceKind
+}
+
+func (nv *nodeRefVisitor) Visit(curr ast.Node) ast.Visitor {
+	if curr == nil {
+		// Reached a dead end.
+		return nil
+	}
+
+	_, isScalar := curr.(ast.ScalarNode)
+
+	if isScalar {
+		switch nv.refKindToFind {
+
+		}
+	}
+
+	return nv
+}
+
+// ref kind -> func that returns if node matches or not.
+func refKindToMatchingNode(posToFind token.Position) map[evgReferenceKind]func(node ast.Node) (refID string, pos *token.Position, match bool) {
+	return map[evgReferenceKind]func(node ast.Node) (refID string, pos *token.Position, match bool){
+		referenceKindTaskOrTaskGroup: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if bvTaskSelectorPath.MatchString(path) && !strings.Contains(node.String(), ".") {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindTag: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+
+			if tagPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+
+			if !bvTaskSelectorPath.MatchString(path) {
+				return "", nil, false
+			}
+
+			// If using tag selector syntax, determine which particular tag
+			// it is within the string.
+			colWithinSelector := tkn.Position.Column
+			if tkn.Indicator == token.QuotedScalarIndicator {
+				// Since we're parsing the string literal, skip the leading
+				// quotation mark, if any.
+				colWithinSelector++
+			}
+			for _, criterion := range strings.Split(tkn.Value, " ") {
+				// Figure out from the position to find which tag is being
+				// specifically requested.
+				if posToFind.Column >= colWithinSelector && posToFind.Column < colWithinSelector+len(criterion) {
+					// Remove tag notation and any negation.
+					tag := strings.TrimPrefix(strings.TrimPrefix(criterion, "!"), ".")
+					return tag, &token.Position{
+						Line:   posToFind.Line,
+						Column: colWithinSelector + len(criterion) - len(tag),
+					}, true
+				}
+				// Skip past criterion and whitespace.
+				colWithinSelector = colWithinSelector + len(criterion) + 1
+			}
+			return "", nil, false
+		},
+		referenceKindTask: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if taskPath.MatchString(path) || tgTaskPath.MatchString(path) || execTaskPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			// Since the depends on task path can omit the name, it's ambiguous
+			// unless you check that it's not a BV.
+			if dependsOnTaskPath.MatchString(path) && !dependsOnBVPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindTaskGroup: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if tgPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindBuildVariant: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if bvPath.MatchString(path) || dependsOnBVPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindDistro: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if distroPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindFunction: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if funcPath.MatchString(path) || funcDefPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+		referenceKindCommand: func(node ast.Node) (string, *token.Position, bool) {
+			path := node.GetPath()
+			tkn := node.GetToken()
+			if cmdPath.MatchString(path) {
+				return tkn.Value, tkn.Position, true
+			}
+			return "", nil, false
+		},
+	}
+}
+
 // convertLSPPositionToYAMLPosition converts a 0-indexed LSP position to a
 // 1-indexed YAML position.
 func convertLSPPositionToYAMLPosition(pos lsp.Position) token.Position {
@@ -769,7 +861,7 @@ func uriToFilepath(uri lsp.DocumentURI) (string, error) {
 	return path, nil
 }
 
-func (lsh *LanguageServerHandler) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params lsp.CompletionParams) (*lsp.CompletionList, error) {
+func (lsh *LanguageServerHandler) handleCompletion(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params lsp.CompletionParams) (*lsp.CompletionList, error) {
 	// filepath, err := uriToFilepath(params.TextDocument.URI)
 	// if err != nil {
 	//     return nil, errors.Wrapf(err, "getting filepath from URI '%s'", params.TextDocument.URI)
@@ -792,5 +884,9 @@ func (lsh *LanguageServerHandler) handleTextDocumentCompletion(ctx context.Conte
 	//     }
 	// }
 
-	return nil, errors.New("kim: TODO: implement")
+	return nil, errors.New("TODO: implement")
+}
+
+func yamlPosToString(pos token.Position) string {
+	return fmt.Sprintf("%d:%d", pos.Line, pos.Column)
 }
