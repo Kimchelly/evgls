@@ -22,8 +22,7 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 )
 
-// kim: TODO: start working on documentation (static)
-//  TODO: get aliases/anchors/merge keys working with go to definition (low priority)
+//  TODO: get aliases/anchors/merge keys working (low priority)
 
 /*
 textDocument/completion
@@ -1507,6 +1506,9 @@ func getAllMatchingDocs() []matchingDocs {
 		{
 			// Command (generic)
 			isMatch: func(ref *nodeRef) bool {
+				// Since the ref finder only detects scalars and doesn't
+				// distinguish between map keys vs. values, this has to check
+				// the map key.
 				return ref.refID == "command" && cmdPath.MatchString(ref.node.GetPath())
 			},
 			docs: []lsp.MarkedString{
